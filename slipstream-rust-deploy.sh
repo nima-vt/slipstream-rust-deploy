@@ -567,11 +567,25 @@ verify_iptables_installation() {
         print_warning "ip6tables not found, IPv6 rules will be skipped"
     fi
 
-    # Check if IPv6 is supported on the system
+    # Check if IPv6 is supported and configured on the system
     if [ -f /proc/net/if_inet6 ]; then
-        print_status "IPv6 support detected"
+        print_status "IPv6 kernel support detected (/proc/net/if_inet6 exists)"
+        # Check if IPv6 addresses are actually configured (with timeout to prevent hanging)
+        local ipv6_addrs
+        if command -v timeout &> /dev/null; then
+            ipv6_addrs=$(timeout 2 ip -6 addr show 2>/dev/null | grep -E "inet6 [0-9a-fA-F:]+" | grep -v "::1" | grep -v "fe80:" | head -3 || true)
+        else
+            ipv6_addrs=$(ip -6 addr show 2>/dev/null | grep -E "inet6 [0-9a-fA-F:]+" | grep -v "::1" | grep -v "fe80:" | head -3 || true)
+        fi
+        if [ -n "$ipv6_addrs" ]; then
+            local addr_count
+            addr_count=$(echo "$ipv6_addrs" | wc -l)
+            print_status "IPv6 addresses configured: $addr_count (excluding loopback and link-local)"
+        else
+            print_warning "IPv6 kernel support available but no IPv6 addresses configured"
+        fi
     else
-        print_warning "IPv6 not supported on this system"
+        print_warning "IPv6 not supported on this system (/proc/net/if_inet6 not found)"
     fi
 }
 
@@ -1264,18 +1278,32 @@ configure_iptables() {
 
     # IPv6 rules (if IPv6 and ip6tables are available)
     if command -v ip6tables &> /dev/null && [ -f /proc/net/if_inet6 ]; then
-        print_status "Setting up IPv6 iptables rules..."
-
-        if ip6tables -I INPUT -p udp --dport "$SLIPSTREAM_PORT" -j ACCEPT 2>/dev/null; then
-            print_status "IPv6 INPUT rule added successfully"
+        # Check if IPv6 addresses are actually configured (with timeout to prevent hanging)
+        local ipv6_addrs
+        if command -v timeout &> /dev/null; then
+            ipv6_addrs=$(timeout 2 ip -6 addr show 2>/dev/null | grep -E "inet6 [0-9a-fA-F:]+" | grep -v "::1" | grep -v "fe80:" || true)
         else
-            print_warning "Failed to add IPv6 INPUT rule (IPv6 might not be fully configured)"
+            ipv6_addrs=$(ip -6 addr show 2>/dev/null | grep -E "inet6 [0-9a-fA-F:]+" | grep -v "::1" | grep -v "fe80:" || true)
         fi
+        
+        if [ -n "$ipv6_addrs" ]; then
+            local addr_count
+            addr_count=$(echo "$ipv6_addrs" | wc -l)
+            print_status "Setting up IPv6 iptables rules (IPv6 addresses configured: $addr_count)..."
 
-        if ip6tables -t nat -I PREROUTING -i "$interface" -p udp --dport 53 -j REDIRECT --to-ports "$SLIPSTREAM_PORT" 2>/dev/null; then
-            print_status "IPv6 NAT rule added successfully"
+            if ip6tables -I INPUT -p udp --dport "$SLIPSTREAM_PORT" -j ACCEPT 2>/dev/null; then
+                print_status "IPv6 INPUT rule added successfully"
+            else
+                print_warning "Failed to add IPv6 INPUT rule (IPv6 might not be fully configured)"
+            fi
+
+            if ip6tables -t nat -I PREROUTING -i "$interface" -p udp --dport 53 -j REDIRECT --to-ports "$SLIPSTREAM_PORT" 2>/dev/null; then
+                print_status "IPv6 NAT rule added successfully"
+            else
+                print_warning "Failed to add IPv6 NAT rule (IPv6 NAT might not be supported)"
+            fi
         else
-            print_warning "Failed to add IPv6 NAT rule (IPv6 NAT might not be supported)"
+            print_warning "IPv6 kernel support available but no IPv6 addresses configured, skipping IPv6 iptables rules"
         fi
     else
         if ! command -v ip6tables &> /dev/null; then
@@ -1815,14 +1843,57 @@ create_systemd_service() {
     fi
 
     local dns_listen_host="0.0.0.0"
-    if command -v ip6tables &> /dev/null && [ -f /proc/net/if_inet6 ]; then
-        if ip -6 addr show | grep -q "inet6"; then
-            dns_listen_host="::"
-            print_status "IPv6 detected, using :: for dual-stack support"
+    local ipv6_support=false
+    local ipv6_configured=false
+    local ipv6_info=""
+    
+    # Check IPv6 support
+    if command -v ip6tables &> /dev/null; then
+        ipv6_support=true
+        ipv6_info="ip6tables: available"
+    else
+        ipv6_info="ip6tables: not available"
+    fi
+    
+    if [ -f /proc/net/if_inet6 ]; then
+        if [ "$ipv6_support" = true ]; then
+            ipv6_info="$ipv6_info, /proc/net/if_inet6: exists"
         else
-            print_status "IPv6 not configured, using 0.0.0.0 for IPv4 only"
+            ipv6_info="$ipv6_info, /proc/net/if_inet6: exists"
         fi
     else
+        ipv6_info="$ipv6_info, /proc/net/if_inet6: not found"
+    fi
+    
+    # Check if IPv6 addresses are actually configured (with timeout to prevent hanging)
+    if [ "$ipv6_support" = true ] && [ -f /proc/net/if_inet6 ]; then
+        local ipv6_addrs
+        if command -v timeout &> /dev/null; then
+            ipv6_addrs=$(timeout 2 ip -6 addr show 2>/dev/null | grep -E "inet6 [0-9a-fA-F:]+" | grep -v "::1" | grep -v "fe80:" | head -3 || true)
+        else
+            ipv6_addrs=$(ip -6 addr show 2>/dev/null | grep -E "inet6 [0-9a-fA-F:]+" | grep -v "::1" | grep -v "fe80:" | head -3 || true)
+        fi
+        if [ -n "$ipv6_addrs" ]; then
+            ipv6_configured=true
+            local addr_count
+            addr_count=$(echo "$ipv6_addrs" | wc -l)
+            ipv6_info="$ipv6_info, IPv6 addresses: $addr_count configured"
+            print_status "IPv6 detection details:"
+            print_status "  $ipv6_info"
+            echo "$ipv6_addrs" | while read -r line; do
+                print_status "    - $line"
+            done
+            dns_listen_host="::"
+            print_status "IPv6 detected and configured, using :: for dual-stack support"
+        else
+            ipv6_info="$ipv6_info, IPv6 addresses: none configured"
+            print_status "IPv6 detection details:"
+            print_status "  $ipv6_info"
+            print_status "IPv6 support available but no addresses configured, using 0.0.0.0 for IPv4 only"
+        fi
+    else
+        print_status "IPv6 detection details:"
+        print_status "  $ipv6_info"
         print_status "IPv6 not available, using 0.0.0.0 for IPv4 only"
     fi
 
